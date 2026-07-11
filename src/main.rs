@@ -1,5 +1,5 @@
-use crate::trees::bst::BinarySearchTree;
-
 mod trees;
 
-fn main() {}
+fn main() {
+    println!("{}", std::mem::size_of::<u16>());
+}
