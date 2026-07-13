@@ -9,14 +9,53 @@ const HEADER_SIZE: usize = 4 + 1 + 2 + 2 + 2 + 1; // for the calculation look at
 /// This is a B*-tree implementation
 struct Btree {
     root: Option<Node>,
+    pager: Pager,
 }
 
 /// the actual page mapping 1:1 to the Node
 struct Node {
     page: Page,
     degree: usize,
-    keys: i64,          // TODO: allow generics, add flexible comparator
     children: Vec<u32>, // page ids of children
+}
+
+impl Node {
+    fn new(page: Page, degree: usize, children: Vec<u32>) -> Self {
+        Node {
+            page,
+            degree,
+            children,
+        }
+    }
+
+    pub fn search(&self, val: i64, pager: &mut Pager) -> Result<bool, Box<dyn Error>> {
+        let mut page = &self.page;
+        loop {
+            let header = PageHeader::deserialize(&page.data[0..12]);
+            match header {
+                Some(p_hdr) => {
+                    let cells: Vec<Cell> = self.page.get_cells(&p_hdr);
+                    match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
+                        Ok(_) => return Ok(true),
+                        Err(i) => {
+                            if p_hdr.page_ty == PageKind::Leaf {
+                                return Ok(false);
+                            }
+
+                            let child_page_id = self.children.get(i).unwrap();
+                            let child_page = pager.fetch(*child_page_id);
+                            page = child_page;
+                        }
+                    };
+                }
+                None => return Err("Coundn't deserialize the header".into()),
+            }
+        }
+    }
+
+    pub fn insert(&mut self, val: i64) -> Result<(), Box<dyn Error>> {
+        todo!()
+    }
 }
 
 /// Layout will be like: \[header\]—\[p1\]—\[p2\]—\[free_space\]—\[cell2\]—\[cell2\]
@@ -25,10 +64,13 @@ struct Page {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum PageKind {
+    /// root node bruh
     Root = 0,
+    /// This signify nodes that hold separator key and a pointer to the page between two neighboring pointers, _*Key cells*_
     Internal = 1,
+    /// This signify nodes that hold the actual value, _*Key-value cells*_
     Leaf = 2,
 }
 
@@ -75,10 +117,19 @@ impl PageHeader {
     }
 }
 
-/// starting offset → \[Cell\] ← ending offset (ending is the cell_offset)
+/// starting offset → \[Cell\] ← ending offset (ending is the cell_offset), 8 bytes
 struct CellPointer {
     cell_offset: u16,
     cell_size: u16,
+}
+
+/// For `Internal` & `Root` Cells the cells will be structures like \[key: i64 c_ptr: u32\]; 8 + 4
+/// For `Leaf` node the cell will only structured like \[key: i64\]; 8
+struct Cell {
+    // TODO: make keys a generic and pre-compute the key size, but i think should be added as a function
+    // argument so there's not redundant calls. note: we also gotta keep the struct (if key is a struct) as a C repr
+    key: i64,
+    c_ptr: Option<u32>, // None for PageKind::Leaf
 }
 
 impl Page {
@@ -131,6 +182,64 @@ impl Page {
             cell_size: u16::from_le_bytes(self.data[off + 2..off + 4].try_into().unwrap()),
         }
     }
+
+    pub fn get_cells(&self, p_hdr: &PageHeader) -> Vec<Cell> {
+        let range = (p_hdr.free_start as u32 / 4) as u16; // 4 bytes per ptr
+
+        let mut cells = Vec::with_capacity(range as usize);
+
+        match p_hdr.page_ty {
+            PageKind::Leaf => {
+                for i in 0..range {
+                    let slot = self.slot(i);
+                    let cell_offset = slot.cell_offset as usize;
+                    let cell_size = slot.cell_size as usize;
+                    cells.push(Cell {
+                        key: i64::from_le_bytes(
+                            self.data[cell_offset..cell_offset + cell_size]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        c_ptr: None,
+                    });
+                }
+            }
+            _ => {
+                for i in 0..range {
+                    let slot = self.slot(i);
+                    let cell_offset = slot.cell_offset as usize;
+                    let cell_size = slot.cell_size as usize;
+                    cells.push(Cell {
+                        key: i64::from_le_bytes(
+                            self.data[cell_offset..cell_offset + cell_size - 4]
+                                .try_into()
+                                .unwrap(),
+                        ),
+                        c_ptr: Some(u32::from_le_bytes(
+                            self.data[cell_offset + cell_size - 4..cell_offset + cell_size]
+                                .try_into()
+                                .unwrap(),
+                        )),
+                    });
+                }
+            }
+        }
+
+        cells
+    }
+
+    // TODO: for deletion we will later have an availablity list so we can avoid unreachable cells.
+
+    //     match page_ty {
+    //         PageKind::Leaf => Cell {
+    //             key: i64::from_le_bytes(cell[0..8].try_into().unwrap()),
+    //             c_ptr: None,
+    //         },
+    //         _ => Cell {
+    //             key: i64::from_le_bytes(cell[0..8].try_into().unwrap()),
+    //             c_ptr: Some(u32::from_le_bytes(cell[8..12].try_into().unwrap())),
+    //         },
+    //     }
 
     fn cell(&self, i: u16) -> &[u8] {
         let s = self.slot(i);
