@@ -1,10 +1,11 @@
 #![allow(dead_code)]
 
 use std::{
+    cell::{RefCell, RefMut},
+    collections::HashMap,
     error::Error,
-    fs::OpenOptions,
-    io::{Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
+    path::PathBuf,
 };
 
 pub const PAGE_SIZE: usize = 4096;
@@ -13,26 +14,38 @@ const HEADER_SIZE: usize = 4 + 1 + 2 + 2 + 2 + 1 + 4; // for the calculation loo
 const DEGREE: usize = 3; // 4 keys per node at max, 2 keys min
 
 /// This is a B*-tree implementation
-struct Btree {
-    root_id: u32,
-    pager: Pager,
+pub struct Btree {
+    pub root_id: u32,
+    pub pager: Pager,
 }
 
-struct Node {
-    page_id: u32,
-}
+impl Btree {
+    pub fn new(val: i64, path_buf: PathBuf) -> Result<Self, Box<dyn Error>> {
+        let file = match std::fs::File::open(&path_buf) {
+            Ok(f) => f,
+            _ => std::fs::File::create(&path_buf).unwrap(),
+        };
 
-impl Node {
-    fn new(page_id: u32) -> Self {
-        Self { page_id }
+        let mut pager = Pager {
+            file,
+            frames: HashMap::new().into(),
+            path_buf,
+            next_id: 1,
+        };
+        let root_id = pager.allocate();
+        pager.fetch(root_id).add_cell(&val.to_le_bytes())?;
+
+        Ok(Btree { root_id, pager })
     }
 
-    pub fn search(&self, val: i64, pager: &mut Pager) -> Result<bool, Box<dyn Error>> {
-        let mut page = pager.fetch(self.page_id);
+    pub fn search(&self, val: i64) -> Result<bool, Box<dyn Error>> {
+        let mut page_id = self.root_id;
         loop {
-            let header = page.header();
-            let p_hdr = header?;
-            let cells: Vec<Cell> = page.get_cells(&p_hdr);
+            let (cells, p_hdr) = {
+                let page = self.pager.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells(&p_hdr), p_hdr)
+            };
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
                 Ok(_) => return Ok(true),
                 Err(i) => {
@@ -41,23 +54,25 @@ impl Node {
                     }
 
                     let child_page_id = cells.get(i).unwrap().c_ptr.unwrap();
-                    let child_page = pager.fetch(child_page_id);
-                    page = child_page;
+                    page_id = child_page_id;
                 }
             };
         }
     }
 
-    fn insertion_point(&mut self, val: i64, pager: &mut Pager) -> Result<Vec<u32>, Box<dyn Error>> {
+    fn insertion_point(&mut self, val: i64) -> Result<Vec<u32>, Box<dyn Error>> {
         let mut breadcrumb: Vec<u32> = Vec::new(); // stack for tracing the path
 
-        let mut page = pager.fetch(self.page_id);
+        let mut page_id = self.root_id;
         // descend till the leaf node, and insert in the right position.
         // we handle overflow
         loop {
-            let p_hdr = page.header()?;
+            let (cells, p_hdr) = {
+                let page = self.pager.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells(&p_hdr), p_hdr)
+            };
             breadcrumb.push(p_hdr.id);
-            let cells: Vec<Cell> = page.get_cells(&p_hdr);
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
                 Ok(_) => return Err("Already exists".into()), //  TODO: handle dupes
                 Err(i) => {
@@ -65,26 +80,31 @@ impl Node {
                         return Ok(breadcrumb);
                     } else {
                         let child_page_id = cells.get(i).unwrap().c_ptr.unwrap();
-                        let child_page = pager.fetch(child_page_id);
-                        page = child_page;
+                        page_id = child_page_id;
                     }
                 }
             };
         }
     }
 
-    pub fn insert(&mut self, val: i64, pager: &mut Pager) -> Result<(), Box<dyn Error>> {
-        let mut breadcrumb = self.insertion_point(val, pager)?;
-        let Some(page_id) = breadcrumb.last() else {
+    pub fn insert(&mut self, val: i64) -> Result<(), Box<dyn Error>> {
+        let mut breadcrumb = self.insertion_point(val)?;
+        let Some(page_id) = breadcrumb.last().copied() else {
             return Err("No page found".into());
         };
-        let page = pager.fetch(*page_id);
 
-        let c_data = val.to_le_bytes();
-        let n_slots = page.add_cell(&c_data)?;
+        let n_slots = {
+            let mut page = self.pager.fetch(page_id);
+            let c_data = val.to_le_bytes();
+            page.add_cell(&c_data)?
+        };
 
         if n_slots >= 2 * DEGREE - 1 {
-            self.handle_overflow(&mut breadcrumb, pager)?;
+            let try_root_id = self.handle_overflow(&mut breadcrumb)?;
+            match try_root_id {
+                Some(new_root_id) => self.root_id = new_root_id,
+                _ => return Ok(()),
+            }
         }
 
         Ok(())
@@ -93,14 +113,13 @@ impl Node {
     pub fn handle_overflow(
         &mut self,
         breadcrumb: &mut Vec<u32>,
-        pager: &mut Pager,
     ) -> Result<Option<u32>, Box<dyn Error>> {
         let Some(overflow_page_id) = breadcrumb.pop() else {
             return Err("Current Page id itself not found".into()); // this error shouldnt even trigger
         };
 
         let (current_hdr, current_cells) = {
-            let page = pager.fetch(overflow_page_id);
+            let page = self.pager.fetch(overflow_page_id);
             let hdr = page.header()?;
             let cells = page.get_cells(&hdr);
             (hdr, cells)
@@ -141,22 +160,22 @@ impl Node {
         };
 
         // rebuild LEFT in place
-        pager.fetch(overflow_page_id).reset_and_fill(
+        self.pager.fetch(overflow_page_id).reset_and_fill(
             overflow_page_id,
             current_hdr.page_ty,
             left_rightmost,
-            &current_cells,
+            left_cells,
         )?;
 
         // move RIGHT to new page
-        let right_page_id = pager.allocate();
+        let right_page_id = self.pager.allocate();
         let right_rightmost = if is_leaf {
             0
         } else {
             current_hdr.rightmost_ptr
         };
 
-        pager.fetch(right_page_id).reset_and_fill(
+        self.pager.fetch(right_page_id).reset_and_fill(
             right_page_id,
             current_hdr.page_ty,
             right_rightmost,
@@ -165,9 +184,9 @@ impl Node {
 
         let Some(parent_id) = breadcrumb.pop() else {
             // because there's no parent for the root, we extend the tree level by 1
-            let new_root_id = pager.allocate();
+            let new_root_id = self.pager.allocate();
 
-            pager.fetch(new_root_id).reset_and_fill(
+            self.pager.fetch(new_root_id).reset_and_fill(
                 new_root_id,
                 PageKind::Root,
                 right_page_id,
@@ -178,9 +197,9 @@ impl Node {
             buf.extend_from_slice(&promoted_key.to_le_bytes());
             buf.extend_from_slice(&overflow_page_id.to_le_bytes());
 
-            pager.fetch(new_root_id).add_cell(&buf)?;
+            self.pager.fetch(new_root_id).add_cell(&buf)?;
 
-            pager.fetch(overflow_page_id).set_page_ty(if is_leaf {
+            self.pager.fetch(overflow_page_id).set_page_ty(if is_leaf {
                 PageKind::Leaf
             } else {
                 PageKind::Internal
@@ -190,11 +209,13 @@ impl Node {
         };
 
         // repoint whichever pointer in parent used to reference overflow_page_id (now LEFT) to RIGHT
-        let parent_hdr = pager.fetch(parent_id).header()?;
+        let parent_hdr = self.pager.fetch(parent_id).header()?;
         if parent_hdr.rightmost_ptr == overflow_page_id {
-            pager.fetch(parent_id).set_rightmost_ptr(right_page_id)?;
+            self.pager
+                .fetch(parent_id)
+                .set_rightmost_ptr(right_page_id)?;
         } else {
-            let parent_cells = pager.fetch(parent_id).get_cells(&parent_hdr);
+            let parent_cells = self.pager.fetch(parent_id).get_cells(&parent_hdr);
             let idx = parent_cells
                 .iter()
                 .position(|c| c.c_ptr == Some(overflow_page_id))
@@ -205,11 +226,14 @@ impl Node {
             buf.extend_from_slice(&promoted_key.to_le_bytes());
             buf.extend_from_slice(&overflow_page_id.to_le_bytes());
 
-            let parent_n_slots = pager.fetch(parent_id).add_cell(&buf)?;
+            self.pager
+                .fetch(parent_id)
+                .set_child_ptr_at(idx, right_page_id)?;
+            let parent_n_slots = self.pager.fetch(parent_id).add_cell(&buf)?;
 
             if parent_n_slots >= 2 * DEGREE - 1 {
                 breadcrumb.push(parent_id);
-                return self.handle_overflow(breadcrumb, pager);
+                return self.handle_overflow(breadcrumb);
             }
         }
 
@@ -219,7 +243,7 @@ impl Node {
 
 /// Layout will be like: \[header\]—\[p1\]—\[p2\]—\[free_space\]—\[cell2\]—\[cell2\]
 /// the actual page mapping 1:1 to the Node
-struct Page {
+pub struct Page {
     data: [u8; PAGE_SIZE], // LE
 }
 
@@ -451,7 +475,7 @@ impl Page {
         Ok(())
     }
 
-    pub fn remove_cell(&mut self, idx: usize) -> Result<Page, Box<dyn Error>> {
+    pub fn remove_cell(&mut self, _idx: usize) -> Result<Page, Box<dyn Error>> {
         todo!()
     }
 
@@ -484,9 +508,9 @@ impl Page {
     }
 }
 
-struct Pager {
+pub struct Pager {
     file: std::fs::File,
-    frames: std::collections::HashMap<u32, Page>, // TODO: add eviction poilicies
+    frames: RefCell<HashMap<u32, Page>>, // TODO: add eviction poilicies
     path_buf: std::path::PathBuf,
     next_id: u32,
 }
@@ -494,8 +518,8 @@ struct Pager {
 impl Pager {
     pub fn flush_all(&mut self) -> Result<(), Box<dyn Error>> {
         let mut ids = Vec::new();
-        for id in self.frames.keys() {
-            ids.push(*id);
+        for id in self.frames.try_borrow_mut().unwrap().keys().copied() {
+            ids.push(id);
         }
 
         for id in ids {
@@ -505,25 +529,24 @@ impl Pager {
     }
 
     pub fn flush(&mut self, id: u32) -> Result<(), Box<dyn Error>> {
-        let mut file = OpenOptions::new().write(true).open(&self.path_buf)?;
-        let offset = PAGE_SIZE * id as usize;
-        file.seek(SeekFrom::Start(offset as u64))?;
-
-        let buf = self.fetch(id).data;
-
-        file.write_all(&buf)?;
-        self.remove_entry(id);
-
+        if let Some(page) = self.frames.borrow_mut().remove(&id) {
+            let offset = Self::page_offset(id);
+            self.file.write_all_at(&page.data, offset)?;
+        }
         Ok(())
     }
 
-    fn fetch(&mut self, id: u32) -> &mut Page {
-        self.frames.entry(id).or_insert_with(|| {
+    fn fetch(&self, id: u32) -> RefMut<Page> {
+        if !self.frames.borrow().contains_key(&id) {
             let mut buf = [0u8; PAGE_SIZE];
             self.file
                 .read_exact_at(&mut buf, Self::page_offset(id))
                 .unwrap();
-            Page { data: buf }
+            self.frames.borrow_mut().insert(id, Page { data: buf });
+        }
+
+        RefMut::map(self.frames.borrow_mut(), |frames| {
+            frames.get_mut(&id).unwrap()
         })
     }
 
@@ -534,10 +557,11 @@ impl Pager {
     }
 
     fn remove_entry(&mut self, id: u32) {
-        self.frames.remove(&id);
+        self.frames.borrow_mut().remove(&id);
     }
 
     fn page_offset(id: u32) -> u64 {
         id as u64 * PAGE_SIZE as u64
     }
 }
+

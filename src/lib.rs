@@ -2,8 +2,9 @@ mod trees;
 
 #[cfg(test)]
 mod tests {
-    use crate::trees::{avl::AVLTree, bst::BinarySearchTree};
+    use std::error::Error;
 
+    use crate::trees::{avl::AVLTree, bst::BinarySearchTree, btree::Btree};
     // test bst with `cargo test bst`
     fn bst_sample_tree() -> BinarySearchTree {
         //        50
@@ -188,5 +189,12 @@ mod tests {
     fn avl_distance_to_missing_value_panics() {
         let tree = avl_sample_tree();
         tree.distance(999);
+    }
+
+    fn btree_sample_tree() -> Result<Btree, Box<dyn Error>> {
+        let mut btree = Btree::new(20, "./new.txt".into())?;
+        let val = 5;
+        btree.insert(val);
+        todo!()
     }
 }
