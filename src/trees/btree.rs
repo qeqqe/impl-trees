@@ -33,6 +33,9 @@ impl Btree {
             next_id: 1,
         };
         let root_id = pager.allocate();
+        pager
+            .fetch(root_id)
+            .reset_and_fill(root_id, PageKind::Leaf, 0, &[])?;
         pager.fetch(root_id).add_cell(&val.to_le_bytes())?;
 
         Ok(Btree { root_id, pager })
@@ -553,6 +556,12 @@ impl Pager {
     fn allocate(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        self.frames.get_mut().insert(
+            id,
+            Page {
+                data: [0u8; PAGE_SIZE],
+            },
+        );
         id
     }
 
