@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn btree_sample_tree() -> Result<Btree, Box<dyn Error>> {
-        let mut btree = Btree::new(20, "./new.db".into())?;
+        let mut btree = Btree::new(20, "./new".into())?;
         btree.insert(5)?;
         btree.insert(7)?;
         btree.insert(3)?;
@@ -205,6 +205,14 @@ mod tests {
     #[test]
     fn btree_check_search() {
         let btree = btree_sample_tree().unwrap();
-        assert!(btree.search(6).unwrap());
+        let a = btree.search(6).unwrap();
+        assert!(a);
+    }
+
+    #[test]
+    fn btree_insertion_check() {
+        let mut btree = btree_sample_tree().unwrap();
+        btree.insert(124).unwrap();
+        assert!(btree.search(124).unwrap());
     }
 }

@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
+use core::fmt;
 use std::{
     cell::{RefCell, RefMut},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     error::Error,
     os::unix::fs::FileExt,
     path::PathBuf,
@@ -13,10 +14,17 @@ const SLOT_SIZE: usize = 4; // cell_offset: u16 + cell_size: u16
 const HEADER_SIZE: usize = 4 + 1 + 2 + 2 + 2 + 1 + 4; // for the calculation look at the PageHeader struct for data members
 const DEGREE: usize = 3; // 4 keys per node at max, 2 keys min
 
-/// This is a B*-tree implementation
+/// This is a B-tree implementation
 pub struct Btree {
     pub root_id: u32,
     pub pager: Pager,
+}
+
+impl fmt::Display for Btree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pretty_print().unwrap();
+        write!(f, "{}", "")
+    }
 }
 
 impl Btree {
@@ -41,13 +49,51 @@ impl Btree {
         Ok(Btree { root_id, pager })
     }
 
+    pub fn pretty_print(&self) -> Result<(), Box<dyn Error>> {
+        let mut queue = VecDeque::new();
+        queue.push_back(self.root_id);
+        let mut level: usize = 0;
+
+        while !queue.is_empty() {
+            let level_size = queue.len();
+
+            print!("level {level}: ");
+
+            for _ in 0..level_size {
+                let page_id = queue.pop_front().ok_or("Cell not found".to_string())?;
+                let page = self.pager.fetch(page_id);
+                let cells = page.get_cells()?;
+                let p_hdr = page.header()?;
+
+                print!("[");
+                for cell in &cells {
+                    print!(" {} ", cell.key);
+                }
+                print!("]");
+
+                if p_hdr.page_ty != PageKind::Leaf {
+                    let childs: Vec<u32> = cells.iter().map(|c| c.c_ptr.unwrap()).collect();
+                    for c_ptr in childs {
+                        queue.push_back(c_ptr);
+                    }
+                    queue.push_back(p_hdr.rightmost_ptr);
+                }
+            }
+            println!();
+
+            level += 1;
+        }
+
+        Ok(())
+    }
+
     pub fn search(&self, val: i64) -> Result<bool, Box<dyn Error>> {
         let mut page_id = self.root_id;
         loop {
             let (cells, p_hdr) = {
                 let page = self.pager.fetch(page_id);
                 let p_hdr = page.header()?;
-                (page.get_cells(&p_hdr), p_hdr)
+                (page.get_cells()?, p_hdr)
             };
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
                 Ok(_) => return Ok(true),
@@ -56,7 +102,11 @@ impl Btree {
                         return Ok(false);
                     }
 
-                    let child_page_id = cells.get(i).unwrap().c_ptr.unwrap();
+                    let child_page_id = if i < cells.len() {
+                        cells.get(i).unwrap().c_ptr.unwrap()
+                    } else {
+                        p_hdr.rightmost_ptr
+                    };
                     page_id = child_page_id;
                 }
             };
@@ -73,7 +123,7 @@ impl Btree {
             let (cells, p_hdr) = {
                 let page = self.pager.fetch(page_id);
                 let p_hdr = page.header()?;
-                (page.get_cells(&p_hdr), p_hdr)
+                (page.get_cells()?, p_hdr)
             };
             breadcrumb.push(p_hdr.id);
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
@@ -82,7 +132,11 @@ impl Btree {
                     if p_hdr.page_ty == PageKind::Leaf {
                         return Ok(breadcrumb);
                     } else {
-                        let child_page_id = cells.get(i).unwrap().c_ptr.unwrap();
+                        let child_page_id = if i < cells.len() {
+                            cells.get(i).unwrap().c_ptr.unwrap()
+                        } else {
+                            p_hdr.rightmost_ptr
+                        };
                         page_id = child_page_id;
                     }
                 }
@@ -124,13 +178,19 @@ impl Btree {
         let (current_hdr, current_cells) = {
             let page = self.pager.fetch(overflow_page_id);
             let hdr = page.header()?;
-            let cells = page.get_cells(&hdr);
+            let cells = page.get_cells()?;
             (hdr, cells)
         };
 
         let n = current_cells.len();
         let split = n / 2;
-        let is_leaf = current_hdr.page_ty == PageKind::Leaf;
+
+        // we can say that if the first element does not have a child it's either a leaf or a
+        // variant of root which is not big enough to have childs
+        let no_child = match current_cells.first() {
+            Some(c) => !c.c_ptr.is_some(),
+            _ => unreachable!(),
+        };
 
         // so first of all we will split the CURRENT page into three parts
         // [LEFT] || [MEDIAN] || [RIGHT]
@@ -145,10 +205,10 @@ impl Btree {
         // NOTE: Coalescing the empty page will only break page offsets and adds unncessary complexity
         // So we leave it as is.
 
-        let (left_cells, right_cells, promoted_key, left_rightmost) = if is_leaf {
+        let (left_cells, right_cells, promoted_key, left_rightmost) = if no_child {
             (
                 &current_cells[0..split],
-                &current_cells[split..],
+                &current_cells[split + 1..],
                 current_cells[split].key,
                 0u32, // unused for leaves
             )
@@ -172,7 +232,7 @@ impl Btree {
 
         // move RIGHT to new page
         let right_page_id = self.pager.allocate();
-        let right_rightmost = if is_leaf {
+        let right_rightmost = if no_child {
             0
         } else {
             current_hdr.rightmost_ptr
@@ -202,23 +262,31 @@ impl Btree {
 
             self.pager.fetch(new_root_id).add_cell(&buf)?;
 
-            self.pager.fetch(overflow_page_id).set_page_ty(if is_leaf {
-                PageKind::Leaf
-            } else {
-                PageKind::Internal
-            })?;
+            self.pager
+                .fetch(overflow_page_id)
+                .set_page_ty(if no_child {
+                    PageKind::Leaf
+                } else {
+                    PageKind::Internal
+                })?;
 
-            return Ok(Some(right_page_id));
+            return Ok(Some(new_root_id));
         };
 
         // repoint whichever pointer in parent used to reference overflow_page_id (now LEFT) to RIGHT
         let parent_hdr = self.pager.fetch(parent_id).header()?;
-        if parent_hdr.rightmost_ptr == overflow_page_id {
+        let parent_n_slots = if parent_hdr.rightmost_ptr == overflow_page_id {
             self.pager
                 .fetch(parent_id)
                 .set_rightmost_ptr(right_page_id)?;
+
+            let mut buf = Vec::with_capacity(12);
+            buf.extend_from_slice(&promoted_key.to_le_bytes());
+            buf.extend_from_slice(&overflow_page_id.to_le_bytes());
+
+            self.pager.fetch(parent_id).add_cell(&buf)?
         } else {
-            let parent_cells = self.pager.fetch(parent_id).get_cells(&parent_hdr);
+            let parent_cells = self.pager.fetch(parent_id).get_cells()?;
             let idx = parent_cells
                 .iter()
                 .position(|c| c.c_ptr == Some(overflow_page_id))
@@ -232,18 +300,17 @@ impl Btree {
             self.pager
                 .fetch(parent_id)
                 .set_child_ptr_at(idx, right_page_id)?;
-            let parent_n_slots = self.pager.fetch(parent_id).add_cell(&buf)?;
+            self.pager.fetch(parent_id).add_cell(&buf)?
+        };
 
-            if parent_n_slots >= 2 * DEGREE - 1 {
-                breadcrumb.push(parent_id);
-                return self.handle_overflow(breadcrumb);
-            }
+        if parent_n_slots >= 2 * DEGREE - 1 {
+            breadcrumb.push(parent_id);
+            return self.handle_overflow(breadcrumb);
         }
 
         Ok(None)
     }
 }
-
 /// Layout will be like: \[header\]—\[p1\]—\[p2\]—\[free_space\]—\[cell2\]—\[cell2\]
 /// the actual page mapping 1:1 to the Node
 pub struct Page {
@@ -319,7 +386,7 @@ struct CellPointer {
 struct Cell {
     // TODO: make keys a generic and pre-compute the key size, but i think should be added as a function
     // argument so there's not redundant calls. note: we also gotta keep the struct (if key is a struct) as a C repr
-    key: i64,           // 8 bytes
+    pub key: i64,       // 8 bytes
     c_ptr: Option<u32>, // None for PageKind::Leaf, 8 bytes
 }
 
@@ -393,7 +460,8 @@ impl Page {
         Ok(n_slots as usize + 1)
     }
 
-    pub fn get_cells(&self, p_hdr: &PageHeader) -> Vec<Cell> {
+    pub fn get_cells(&self) -> Result<Vec<Cell>, Box<dyn Error>> {
+        let p_hdr = self.header()?;
         let range = ((p_hdr.free_start as u32 - HEADER_SIZE as u32) / 4) as u16; // 4 bytes per ptr
 
         // TODO: update the method for accessing the page raw bytes from the file
@@ -423,7 +491,7 @@ impl Page {
             }
         }
 
-        cells
+        Ok(cells)
     }
 
     fn reset_and_fill(
@@ -573,4 +641,3 @@ impl Pager {
         id as u64 * PAGE_SIZE as u64
     }
 }
-
