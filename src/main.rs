@@ -1,4 +1,4 @@
-use crate::trees::btree::Btree;
+use crate::trees::btree::{Btree, Pager};
 
 mod trees;
 fn main() {
@@ -12,5 +12,11 @@ fn main() {
     btree.insert(12).unwrap();
     btree.insert(3).unwrap();
 
+    println!("{}", btree);
+    btree.remove(12).unwrap();
+    println!("{}", btree);
+    btree.remove(9).unwrap();
+    println!("{}", btree);
+    btree.remove(21).unwrap();
     println!("{}", btree);
 }

@@ -113,8 +113,8 @@ impl Btree {
         }
     }
 
-    fn insertion_point(&mut self, val: i64) -> Result<Vec<u32>, Box<dyn Error>> {
-        let mut breadcrumb: Vec<u32> = Vec::new(); // stack for tracing the path
+    fn get_insertion_breadcrumbs(&mut self, val: i64) -> Result<Vec<u32>, Box<dyn Error>> {
+        let mut breadcrumb: Vec<u32> = Vec::new(); // stack for tracing the descend path
 
         let mut page_id = self.root_id;
         // descend till the leaf node, and insert in the right position.
@@ -127,7 +127,7 @@ impl Btree {
             };
             breadcrumb.push(p_hdr.id);
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
-                Ok(_) => return Err("Already exists".into()), //  TODO: handle dupes
+                Ok(i) => return Err("Already exists".into()), //  TODO: handle dupes
                 Err(i) => {
                     if p_hdr.page_ty == PageKind::Leaf {
                         return Ok(breadcrumb);
@@ -145,7 +145,7 @@ impl Btree {
     }
 
     pub fn insert(&mut self, val: i64) -> Result<(), Box<dyn Error>> {
-        let mut breadcrumb = self.insertion_point(val)?;
+        let mut breadcrumb = self.get_insertion_breadcrumbs(val)?;
         let Some(page_id) = breadcrumb.last().copied() else {
             return Err("No page found".into());
         };
@@ -310,7 +310,350 @@ impl Btree {
 
         Ok(None)
     }
+
+    fn get_deletion_breadcrumbs(&mut self, val: i64) -> Result<(Vec<u32>, usize), Box<dyn Error>> {
+        let mut breadcrumb: Vec<u32> = Vec::new(); // stack for tracing the descend path
+
+        let mut page_id = self.root_id;
+        // descend till the leaf node, and insert in the right position.
+        // we handle overflow
+        loop {
+            let (cells, p_hdr) = {
+                let page = self.pager.fetch(page_id);
+                let p_hdr = page.header()?;
+                (page.get_cells()?, p_hdr)
+            };
+            breadcrumb.push(p_hdr.id);
+            match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
+                Ok(i) => return Ok((breadcrumb, i)),
+                Err(i) => {
+                    if p_hdr.page_ty == PageKind::Leaf {
+                        return Err("Item doesn't exist".into());
+                    } else {
+                        let child_page_id = if i < cells.len() {
+                            cells.get(i).unwrap().c_ptr.unwrap()
+                        } else {
+                            p_hdr.rightmost_ptr
+                        };
+                        page_id = child_page_id;
+                    }
+                }
+            };
+        }
+    }
+
+    pub fn remove(&mut self, val: i64) -> Result<bool, Box<dyn Error>> {
+        let (mut breadcrumbs, idx) = match self.get_deletion_breadcrumbs(val) {
+            Ok(res) => res,
+            Err(_) => return Ok(false),
+        };
+
+        let mut leaf_idx = idx;
+        let mut target_page_id = *breadcrumbs.last().unwrap();
+
+        let target_hdr = self.pager.fetch(target_page_id).header()?;
+        if target_hdr.page_ty != PageKind::Leaf {
+            // predecessor leaf swap swap
+            let target_cells = self.pager.fetch(target_page_id).get_cells()?;
+            let left_child_id = target_cells[idx]
+                .c_ptr
+                .ok_or("internal cell missing child ptr")?;
+            breadcrumbs.push(left_child_id);
+
+            let mut curr_id = left_child_id;
+            loop {
+                let curr_hdr = self.pager.fetch(curr_id).header()?;
+                if curr_hdr.page_ty == PageKind::Leaf {
+                    break;
+                }
+                let next_id = curr_hdr.rightmost_ptr;
+                breadcrumbs.push(next_id);
+                curr_id = next_id;
+            }
+
+            let leaf_id = curr_id;
+            let leaf_cells = self.pager.fetch(leaf_id).get_cells()?;
+            leaf_idx = leaf_cells.len() - 1;
+            let pred_key = leaf_cells[leaf_idx].key;
+
+            // key swap in parent
+            {
+                let mut internal_page = self.pager.fetch(target_page_id);
+                let slot = internal_page.slot(idx as u16);
+                let start = slot.cell_offset as usize;
+                internal_page.data[start..start + 8].copy_from_slice(&pred_key.to_le_bytes());
+            }
+
+            target_page_id = leaf_id;
+        }
+
+        self.pager.fetch(target_page_id).remove_cell(leaf_idx)?;
+
+        self.handle_underflow(&mut breadcrumbs)?;
+
+        Ok(true)
+    }
+
+    pub fn handle_underflow(&mut self, breadcrumbs: &mut Vec<u32>) -> Result<(), Box<dyn Error>> {
+        let Some(page_id) = breadcrumbs.pop() else {
+            return Ok(());
+        };
+
+        let cell_count = self.pager.fetch(page_id).get_cells()?.len();
+        let hdr = self.pager.fetch(page_id).header()?;
+
+        if page_id == self.root_id {
+            if cell_count == 0 && hdr.page_ty != PageKind::Leaf {
+                // root is empty promote rightmost ptr to root
+                let new_root_id = hdr.rightmost_ptr;
+                self.root_id = new_root_id;
+                self.pager.remove_entry(page_id);
+            }
+            return Ok(());
+        }
+
+        if cell_count >= DEGREE - 1 {
+            return Ok(());
+        }
+
+        let Some(&parent_id) = breadcrumbs.last() else {
+            return Err("Parent not found in breadcrumbs for underflow".into());
+        };
+
+        let parent_hdr = self.pager.fetch(parent_id).header()?;
+        let parent_cells = self.pager.fetch(parent_id).get_cells()?;
+
+        let mut children = Vec::new();
+        for cell in &parent_cells {
+            children.push(cell.c_ptr.unwrap());
+        }
+        children.push(parent_hdr.rightmost_ptr);
+
+        let child_idx = children
+            .iter()
+            .position(|&id| id == page_id)
+            .ok_or("Child not found in parent")?;
+
+        // sibling borrowing check
+        if child_idx > 0 {
+            let left_sibling_id = children[child_idx - 1];
+            let left_cells = self.pager.fetch(left_sibling_id).get_cells()?;
+            if left_cells.len() > DEGREE - 1 {
+                self.borrow_from_left(page_id, left_sibling_id, parent_id, child_idx - 1)?;
+                return Ok(());
+            }
+        }
+
+        if child_idx + 1 < children.len() {
+            let right_sibling_id = children[child_idx + 1];
+            let right_cells = self.pager.fetch(right_sibling_id).get_cells()?;
+            if right_cells.len() > DEGREE - 1 {
+                self.borrow_from_right(page_id, right_sibling_id, parent_id, child_idx)?;
+                return Ok(());
+            }
+        }
+
+        // merge
+        if child_idx > 0 {
+            let left_sibling_id = children[child_idx - 1];
+            self.merge_nodes(left_sibling_id, page_id, parent_id, child_idx - 1)?;
+        } else {
+            let right_sibling_id = children[child_idx + 1];
+            self.merge_nodes(page_id, right_sibling_id, parent_id, child_idx)?;
+        }
+
+        self.handle_underflow(breadcrumbs)?;
+        Ok(())
+    }
+
+    fn borrow_from_left(
+        &mut self,
+        page_id: u32,
+        left_id: u32,
+        parent_id: u32,
+        parent_key_idx: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let parent_key = self.pager.fetch(parent_id).get_cells()?[parent_key_idx].key;
+        let left_cells = self.pager.fetch(left_id).get_cells()?;
+        let left_last_cell = &left_cells[left_cells.len() - 1];
+        let sibling_last_key = left_last_cell.key;
+        let sibling_last_ptr = left_last_cell.c_ptr;
+
+        let left_hdr = self.pager.fetch(left_id).header()?;
+        let sibling_rightmost = left_hdr.rightmost_ptr;
+
+        // sibling last key goes up
+        {
+            let mut parent_page = self.pager.fetch(parent_id);
+            let slot = parent_page.slot(parent_key_idx as u16);
+            let start = slot.cell_offset as usize;
+            parent_page.data[start..start + 8].copy_from_slice(&sibling_last_key.to_le_bytes());
+        }
+
+        // parent key goes down
+        let page_hdr = self.pager.fetch(page_id).header()?;
+        let mut page_cells = self.pager.fetch(page_id).get_cells()?;
+
+        let new_first_cell = if page_hdr.page_ty == PageKind::Leaf {
+            Cell {
+                key: parent_key,
+                c_ptr: None,
+            }
+        } else {
+            Cell {
+                key: parent_key,
+                c_ptr: Some(sibling_rightmost),
+            }
+        };
+        page_cells.insert(0, new_first_cell);
+
+        self.pager.fetch(page_id).reset_and_fill(
+            page_id,
+            page_hdr.page_ty,
+            page_hdr.rightmost_ptr,
+            &page_cells,
+        )?;
+
+        // sibling cell removal
+        if page_hdr.page_ty == PageKind::Leaf {
+            self.pager
+                .fetch(left_id)
+                .remove_cell(left_cells.len() - 1)?;
+        } else {
+            let mut left_page = self.pager.fetch(left_id);
+            left_page.set_rightmost_ptr(sibling_last_ptr.unwrap())?;
+            drop(left_page);
+            self.pager
+                .fetch(left_id)
+                .remove_cell(left_cells.len() - 1)?;
+        }
+
+        Ok(())
+    }
+
+    fn borrow_from_right(
+        &mut self,
+        page_id: u32,
+        right_id: u32,
+        parent_id: u32,
+        parent_key_idx: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let parent_key = self.pager.fetch(parent_id).get_cells()?[parent_key_idx].key;
+        let right_cells = self.pager.fetch(right_id).get_cells()?;
+        let right_first_cell = &right_cells[0];
+        let sibling_first_key = right_first_cell.key;
+        let sibling_first_ptr = right_first_cell.c_ptr;
+
+        // sibling first key goes up
+        {
+            let mut parent_page = self.pager.fetch(parent_id);
+            let slot = parent_page.slot(parent_key_idx as u16);
+            let start = slot.cell_offset as usize;
+            parent_page.data[start..start + 8].copy_from_slice(&sibling_first_key.to_le_bytes());
+        }
+
+        // parent key goes down
+        let page_hdr = self.pager.fetch(page_id).header()?;
+        let mut page_cells = self.pager.fetch(page_id).get_cells()?;
+
+        let (new_last_cell, new_rightmost) = if page_hdr.page_ty == PageKind::Leaf {
+            (
+                Cell {
+                    key: parent_key,
+                    c_ptr: None,
+                },
+                0,
+            )
+        } else {
+            (
+                Cell {
+                    key: parent_key,
+                    c_ptr: Some(page_hdr.rightmost_ptr),
+                },
+                sibling_first_ptr.unwrap(),
+            )
+        };
+        page_cells.push(new_last_cell);
+
+        self.pager.fetch(page_id).reset_and_fill(
+            page_id,
+            page_hdr.page_ty,
+            if page_hdr.page_ty == PageKind::Leaf {
+                0
+            } else {
+                new_rightmost
+            },
+            &page_cells,
+        )?;
+
+        // sibling first cell removal
+        self.pager.fetch(right_id).remove_cell(0)?;
+
+        Ok(())
+    }
+
+    fn merge_nodes(
+        &mut self,
+        left_id: u32,
+        right_id: u32,
+        parent_id: u32,
+        parent_key_idx: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let parent_key = self.pager.fetch(parent_id).get_cells()?[parent_key_idx].key;
+        let left_hdr = self.pager.fetch(left_id).header()?;
+        let right_hdr = self.pager.fetch(right_id).header()?;
+
+        let mut left_cells = self.pager.fetch(left_id).get_cells()?;
+        let right_cells = self.pager.fetch(right_id).get_cells()?;
+
+        // parent key merges to left
+        if left_hdr.page_ty == PageKind::Leaf {
+            left_cells.push(Cell {
+                key: parent_key,
+                c_ptr: None,
+            });
+        } else {
+            left_cells.push(Cell {
+                key: parent_key,
+                c_ptr: Some(left_hdr.rightmost_ptr),
+            });
+        }
+
+        left_cells.extend(right_cells);
+
+        let new_left_rightmost = if left_hdr.page_ty == PageKind::Leaf {
+            0
+        } else {
+            right_hdr.rightmost_ptr
+        };
+
+        self.pager.fetch(left_id).reset_and_fill(
+            left_id,
+            left_hdr.page_ty,
+            new_left_rightmost,
+            &left_cells,
+        )?;
+
+        // fix the parent pointers
+        let parent_hdr = self.pager.fetch(parent_id).header()?;
+        if parent_hdr.rightmost_ptr == right_id {
+            self.pager.fetch(parent_id).set_rightmost_ptr(left_id)?;
+        } else {
+            self.pager
+                .fetch(parent_id)
+                .set_child_ptr_at(parent_key_idx + 1, left_id)?;
+        }
+
+        // drop parent separating cell
+        self.pager.fetch(parent_id).remove_cell(parent_key_idx)?;
+
+        // kill right sibling
+        self.pager.remove_entry(right_id);
+
+        Ok(())
+    }
 }
+
 /// Layout will be like: \[header\]—\[p1\]—\[p2\]—\[free_space\]—\[cell2\]—\[cell2\]
 /// the actual page mapping 1:1 to the Node
 pub struct Page {
@@ -546,8 +889,15 @@ impl Page {
         Ok(())
     }
 
-    pub fn remove_cell(&mut self, _idx: usize) -> Result<Page, Box<dyn Error>> {
-        todo!()
+    pub fn remove_cell(&mut self, idx: usize) -> Result<Page, Box<dyn Error>> {
+        let hdr = self.header()?;
+        let mut cells = self.get_cells()?;
+        if idx >= cells.len() {
+            return Err("index out of bounds".into());
+        }
+        cells.remove(idx);
+        self.reset_and_fill(hdr.id, hdr.page_ty, hdr.rightmost_ptr, &cells)?;
+        Ok(Page { data: self.data })
     }
 
     fn num_slots(&mut self) -> u16 {
@@ -641,3 +991,4 @@ impl Pager {
         id as u64 * PAGE_SIZE as u64
     }
 }
+
