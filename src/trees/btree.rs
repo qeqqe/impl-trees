@@ -23,7 +23,7 @@ pub struct Btree {
 impl fmt::Display for Btree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.pretty_print().unwrap();
-        write!(f, "{}", "")
+        write!(f, "")
     }
 }
 
@@ -127,7 +127,7 @@ impl Btree {
             };
             breadcrumb.push(p_hdr.id);
             match cells.binary_search_by(|cell| cell.key.cmp(&val)) {
-                Ok(i) => return Err("Already exists".into()), //  TODO: handle dupes
+                Ok(_) => return Err("Already exists".into()), //  TODO: handle dupes
                 Err(i) => {
                     if p_hdr.page_ty == PageKind::Leaf {
                         return Ok(breadcrumb);
@@ -682,7 +682,6 @@ impl PageKind {
     }
 }
 
-// TODO:: Add rightmost pointer
 struct PageHeader {
     id: u32,
     page_ty: PageKind,
@@ -803,7 +802,7 @@ impl Page {
         Ok(n_slots as usize + 1)
     }
 
-    pub fn get_cells(&self) -> Result<Vec<Cell>, Box<dyn Error>> {
+    fn get_cells(&self) -> Result<Vec<Cell>, Box<dyn Error>> {
         let p_hdr = self.header()?;
         let range = ((p_hdr.free_start as u32 - HEADER_SIZE as u32) / 4) as u16; // 4 bytes per ptr
 
@@ -923,7 +922,7 @@ impl Page {
         &self.data[start..start + s.cell_size as usize]
     }
 
-    pub fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
+    fn header(&self) -> Result<PageHeader, Box<dyn Error>> {
         PageHeader::deserialize(&self.data[..HEADER_SIZE])
             .ok_or("Couldn't deserialize the header".into())
     }
@@ -957,7 +956,7 @@ impl Pager {
         Ok(())
     }
 
-    fn fetch(&self, id: u32) -> RefMut<Page> {
+    fn fetch(&self, id: u32) -> RefMut<'_, Page> {
         if !self.frames.borrow().contains_key(&id) {
             let mut buf = [0u8; PAGE_SIZE];
             self.file
@@ -991,4 +990,3 @@ impl Pager {
         id as u64 * PAGE_SIZE as u64
     }
 }
-
