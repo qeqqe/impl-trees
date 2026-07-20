@@ -192,7 +192,7 @@ mod tests {
     }
 
     fn btree_sample_tree() -> Result<Btree, Box<dyn Error>> {
-        let mut btree = Btree::new(20, "./new".into())?;
+        let mut btree = Btree::new(2, "./new".into())?;
         btree.insert(5)?;
         btree.insert(7)?;
         btree.insert(3)?;
@@ -214,5 +214,45 @@ mod tests {
         let mut btree = btree_sample_tree().unwrap();
         btree.insert(124).unwrap();
         assert!(btree.search(124).unwrap());
+    }
+
+    #[test]
+    fn btree_deletion_check() {
+        let mut btree = btree_sample_tree().unwrap();
+        btree.remove(6).unwrap();
+        btree.remove(7).unwrap();
+        assert!(!btree.search(7).unwrap());
+        assert!(!btree.search(6).unwrap());
+    }
+
+    #[test]
+    fn btree_search_non_existent() {
+        let btree = btree_sample_tree().unwrap();
+        assert!(!btree.search(100).unwrap());
+        assert!(!btree.search(0).unwrap());
+    }
+
+    #[test]
+    fn btree_node_splitting() {
+        let mut btree = btree_sample_tree().unwrap();
+
+        for i in 10..200 {
+            btree.insert(i).unwrap();
+        }
+
+        assert!(btree.search(1).unwrap());
+        assert!(btree.search(100).unwrap());
+        assert!(btree.search(199).unwrap());
+    }
+
+    #[test]
+    fn btree_deletion_causes_underflow() {
+        let mut btree = btree_sample_tree().unwrap();
+
+        btree.remove(5).unwrap();
+        assert!(!btree.search(5).unwrap());
+
+        assert!(!btree.search(4).unwrap());
+        assert!(btree.search(6).unwrap());
     }
 }
